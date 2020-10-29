@@ -1,24 +1,20 @@
 import * as path from 'path';
 import * as cdk from '@aws-cdk/core';
 import * as ec2 from '@aws-cdk/aws-ec2';
-import * as ecs from '@aws-cdk/aws-ecs';
+import * as autoscaling from '@aws-cdk/aws-autoscaling';
 import * as elbv2 from '@aws-cdk/aws-elasticloadbalancingv2';
 import * as efs from '@aws-cdk/aws-efs';
 import * as rds from '@aws-cdk/aws-rds';
 import * as secretsManager from '@aws-cdk/aws-secretsmanager'
 import * as iam from '@aws-cdk/aws-iam';
-import * as es from '@aws-cdk/aws-elasticsearch';
-import * as ecr from '@aws-cdk/aws-ecr';
-
 export interface BitBucketServerDatabaseProps {
   instanceType: ec2.InstanceType
 }
 
 export interface BitBucketServerProps {
   vpc: ec2.IVpc;
-  cluster: ecs.ICluster;
-  repository: ecr.IRepository;
   database: BitBucketServerDatabaseProps;
+  instanceType: ec2.InstanceType;
 }
 
 export class BitBucketServer extends cdk.Construct {
@@ -31,11 +27,6 @@ export class BitBucketServer extends cdk.Construct {
 
   fileSystem: efs.FileSystem;
 
-  elasticSearch: es.Domain;
-
-  taskDefinition: ecs.FargateTaskDefinition;
-
-  service: ecs.FargateService;
 
   constructor(scope: cdk.Construct, id: string, props: BitBucketServerProps) {
     super(scope, id);
@@ -47,9 +38,9 @@ export class BitBucketServer extends cdk.Construct {
       allowAllOutbound: true
     });
 
-    const taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSG', {
+    const appSecurityGroup = new ec2.SecurityGroup(this, 'AppSG', {
       vpc: props.vpc,
-      description: 'security group for the bitbucket container',
+      description: 'security group for the bitbucket server',
       allowAllOutbound: true
     });
 
@@ -61,14 +52,14 @@ export class BitBucketServer extends cdk.Construct {
 
     const dbSecurityGroup = new ec2.SecurityGroup(this, 'DbSG', {
       vpc: props.vpc,
-      description: 'allow access to the bitbucket container',
+      description: 'allow access to the bitbucket database',
       allowAllOutbound: true
     });
 
     albSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), 'allow connections to the alb from the internet');
-    taskSecurityGroup.addIngressRule(albSecurityGroup, ec2.Port.tcp(7990), 'allow connections from the alb to the container');
-    dbSecurityGroup.addIngressRule(taskSecurityGroup, ec2.Port.tcp(5432), 'allow connections from the container to the database');
-    efsSecurityGroup.addIngressRule(taskSecurityGroup, ec2.Port.tcp(2049), 'allow connections from the vpc to the file system');
+    appSecurityGroup.addIngressRule(albSecurityGroup, ec2.Port.tcp(7990), 'allow connections from the alb to the server');
+    dbSecurityGroup.addIngressRule(appSecurityGroup, ec2.Port.tcp(5432), 'allow connections from the server to the database');
+    efsSecurityGroup.addIngressRule(appSecurityGroup, ec2.Port.tcp(2049), 'allow connections from the vpc to the file system');
 
     // create the database password
     this.databasePassowrd = new secretsManager.Secret(this, 'DatabasePassword', {
@@ -115,85 +106,89 @@ export class BitBucketServer extends cdk.Construct {
       internetFacing: true
     });
 
-    // create the fargate task
-    const taskExecutionRole = new iam.Role(this, 'TaskExecutionRole', {
-      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    // create the application server
+    const appRole = new iam.Role(this, 'Role', {
+      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
     });
 
-    taskExecutionRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'))
-    this.databasePassowrd.grantRead(taskExecutionRole);
+    this.databasePassowrd.grantRead(appRole);
+    appRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonEC2RoleforSSM'));
 
-    this.taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDef', {
-      family: 'bitbucket',
-      executionRole: taskExecutionRole,
-      memoryLimitMiB: 2048,
-      cpu: 1024
+    const userData = ec2.UserData.forLinux();
+
+    userData.addCommands(
+
+      // base configuration
+      'set -ex',
+      'yum update -y',
+      'yum install -y git curl jq ca-certificates java-11-amazon-corretto amazon-efs-utils',
+      'echo "BITBUCKET_HOME=/var/atlassian/application-data/bitbucket" >> /etc/environment',
+      'echo "BITBUCKET_INSTALL_DIR=/opt/atlassian/bitbucket" >> /etc/environment',
+      'echo "BITBUCKET_VERSION=7.1.1" >> /etc/environment',
+      'echo "AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r \'.region\')" >> /etc/environment',
+      'echo "JAVA_HOME=/usr/lib/jvm/java-11-amazon-corretto.x86_64" >> /etc/environment',
+      'echo "JRE_HOME=/etc/alternatives/jre" >> /etc/environment',
+      'source /etc/environment',
+      'aws configure set default.region ${AWS_REGION}',
+
+      // mount the efs point
+      'mkdir -p /var/atlassian',
+      `mount -t efs -o tls ${this.fileSystem.fileSystemId}:/ /var/atlassian`,
+      `echo "${this.fileSystem.fileSystemId}:/ /var/atlassian efs _netdev,tls,iam 0 0" >> /etc/fstab`,
+
+      // install bitbucket
+      'mkdir -p $BITBUCKET_HOME $BITBUCKET_INSTALL_DIR',
+      'curl -L --silent https://product-downloads.atlassian.com/software/stash/downloads/atlassian-bitbucket-$BITBUCKET_VERSION.tar.gz | tar -xz --strip-components=1 -C "${BITBUCKET_INSTALL_DIR}"',
+
+      // create the systemd unit file
+      'echo "[Unit]" >> /etc/systemd/system/bitbucket.service',
+      'echo "Description=Atlassian Bitbucket Server Service" >> /etc/systemd/system/bitbucket.service',
+      'echo "After=syslog.target network.target" >> /etc/systemd/system/bitbucket.service',
+      'echo "" >> /etc/systemd/system/bitbucket.service',
+      'echo "[Service]" >> /etc/systemd/system/bitbucket.service',
+      'echo "Environment=/etc/environment" >> /etc/systemd/system/bitbucket.service',
+      'echo "Type=forking" >> /etc/systemd/system/bitbucket.service',
+      'echo "ExecStart=$BITBUCKET_INSTALL_DIR/bin/start-bitbucket.sh" >> /etc/systemd/system/bitbucket.service',
+      'echo "ExecStop=$BITBUCKET_INSTALL_DIR/bin/stop-bitbucket.sh" >> /etc/systemd/system/bitbucket.service',
+      'echo "" >> /etc/systemd/system/bitbucket.service',
+      'echo "[Install]" >> /etc/systemd/system/bitbucket.service',
+      'echo "WantedBy=multi-user.target" >> /etc/systemd/system/bitbucket.service',
+
+      // configure bitbucket, first we clear out the file
+      'echo "" > $BITBUCKET_HOME/bitbucket.properties',
+      'echo "jdbc.driver=org.postgresql.Driver" >> $BITBUCKET_HOME/bitbucket.properties',
+      `echo "jdbc.url=jdbc:postgresql://${this.database.clusterEndpoint.socketAddress}/bitbucket" >> $BITBUCKET_HOME/bitbucket.properties`,
+      'echo "jdbc.user=bitbucket" >> $BITBUCKET_HOME/bitbucket.properties',
+      `echo "jdbc.password=$(aws secretsmanager get-secret-value --secret-id '${this.databasePassowrd.secretArn}' --query SecretString --output text)" >> $BITBUCKET_HOME/bitbucket.properties`,
+
+      // restart the service
+      'systemctl enable bitbucket.service && systemctl start bitbucket.service'
+    );
+
+    const asg = new autoscaling.AutoScalingGroup(this, 'ASG', {
+      vpc: props.vpc,
+      instanceType: props.instanceType,
+      machineImage: ec2.MachineImage.latestAmazonLinux({
+        generation: ec2.AmazonLinuxGeneration.AMAZON_LINUX_2,
+        edition: ec2.AmazonLinuxEdition.STANDARD,
+        virtualization: ec2.AmazonLinuxVirt.HVM,
+        storage: ec2.AmazonLinuxStorage.GENERAL_PURPOSE,
+        cpuType: ec2.AmazonLinuxCpuType.X86_64,
+      }),
+      role: appRole,
+      securityGroup: appSecurityGroup,
+      minCapacity: 1,
+      desiredCapacity: 1,
+      maxCapacity: 1,
+      userData
     });
 
-    const container = this.taskDefinition.addContainer('server', {
-      image: ecs.ContainerImage.fromEcrRepository(props.repository, 'latest'),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'bitbucket-server' }),
-      memoryLimitMiB: 2048,
-      cpu: 1024,
-      environment: {
-        SERVER_PROXY_NAME: this.loadBalancer.loadBalancerDnsName,
-        SERVER_PROXY_PORT: '80',
-        SERVER_SCHEME: 'http',
-        JVM_MAXIMUM_MEMORY: '2048m',
-        JDBC_DRIVER: 'org.postgresql.Driver',
-        JDBC_URL: `jdbc:postgresql://${this.database.clusterEndpoint.socketAddress}/bitbucket`,
-        JDBC_USER: 'bitbucket',
-      },
-      secrets: {
-        JDBC_PASSWORD: ecs.Secret.fromSecretsManager(this.databasePassowrd),
-      }
-    });
-
-    container.addPortMappings({
-      containerPort: 7990
-    });
-
-    // workaround for lack of CDK support for EFS
-    const cfnTask = this.taskDefinition.node.defaultChild as ecs.CfnTaskDefinition;
-
-    cfnTask.addPropertyOverride('Volumes', [{
-      Name: 'bitbucket-shared',
-      EFSVolumeConfiguration: {
-        FilesystemId: this.fileSystem.fileSystemId,
-        TransitEncryption: 'ENABLED'
-      },
-    }]);
-
-    container.addMountPoints({
-      sourceVolume: 'bitbucket-shared',
-      containerPath: '/var/atlassian/application-data/bitbucket/shared',
-      readOnly: false
-    });
-
-    // create the fargate service
-    this.service = new ecs.FargateService(this, 'Service', {
-      cluster: props.cluster,
-      taskDefinition: this.taskDefinition,
-      platformVersion: ecs.FargatePlatformVersion.VERSION1_4,
-      securityGroups: [
-        taskSecurityGroup
-      ]
-    })
-
-    this.service.connections.addSecurityGroup(taskSecurityGroup);
-
-    // add the service the load balancer
+    // add the appp the load balancer
     const targetGroup = new elbv2.ApplicationTargetGroup(this, 'BitBucketTG', {
       vpc: props.vpc,
       port: 7990,
       protocol: elbv2.ApplicationProtocol.HTTP,
-      targetGroupName: 'bitbucket-server',
-      targets: [
-        this.service.loadBalancerTarget({
-          containerName: 'server',
-          containerPort: 7990
-        })
-      ]
+      targets: [asg]
     });
 
     targetGroup.configureHealthCheck({
